@@ -56,7 +56,9 @@ jobs:
           $lnk = (New-Object -ComObject WScript.Shell).CreateShortcut("$([Environment]::GetFolderPath('Programs'))\OmniTempus.SI.lnk")
           "atalho: $($lnk.TargetPath) $($lnk.Arguments)"
           # Same command as the shortcut; -ServerOnly skips opening the browser window on this headless machine.
-          $p = Start-Process $lnk.TargetPath -ArgumentList "$($lnk.Arguments) -ServerOnly" -Wait -PassThru
+          # Not -Wait: in Windows PowerShell it also waits for child processes, and the server it starts runs on.
+          $p = Start-Process $lnk.TargetPath -ArgumentList "$($lnk.Arguments) -ServerOnly" -PassThru
+          if (-not $p.WaitForExit(90000)) { throw 'O lançador não terminou em 90 s.' }
           if ($p.ExitCode -ne 0) { throw "O lançador terminou com código $($p.ExitCode) (o app não respondeu)." }
           (Invoke-WebRequest "$env:URL/api/health" -UseBasicParsing).StatusCode
           "página: $((Invoke-WebRequest "$env:URL/" -UseBasicParsing).StatusCode)"
