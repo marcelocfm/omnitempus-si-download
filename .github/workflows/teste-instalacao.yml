@@ -1,0 +1,107 @@
+# Installs the published OmniTempus.SI on a clean Windows machine, the way a friend would, and checks
+# every step. Run by hand: Actions → "Teste de instalação" → Run workflow. The machine is thrown away
+# at the end. The access key comes from the CHAVE_TESTE secret (short-lived test key).
+name: Teste de instalação
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  instalar:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        # Windows PowerShell 5.1: the one every PC has, the same the app's launcher uses.
+        shell: powershell
+    env:
+      URL: http://127.0.0.1:4317
+    steps:
+      - name: 1. Baixar o instalador publicado (mesmo link da página)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = "https://github.com/${{ github.repository }}/releases/latest/download/OmniTempus.SI-Instalar.exe"
+          Invoke-WebRequest $url -OutFile "$env:RUNNER_TEMP\setup.exe" -UseBasicParsing
+          "baixado: {0:N1} MB, sha256 {1}" -f ((Get-Item "$env:RUNNER_TEMP\setup.exe").Length / 1MB), (Get-FileHash "$env:RUNNER_TEMP\setup.exe").Hash.ToLower()
+
+      - name: 2. Instalar sem perguntas
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $p = Start-Process "$env:RUNNER_TEMP\setup.exe" -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/LOG=$env:RUNNER_TEMP\install.log" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "O instalador terminou com código $($p.ExitCode)." }
+          'instalado sem pedir administrador'
+
+      - name: 3. Conferir pasta, atalhos e link omnitempus://
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $app = "$env:LOCALAPPDATA\Programs\OmniTempus.SI"
+          foreach ($f in 'runtime\node.exe', 'app\server\index.ts', 'app\dist\index.html', 'launcher\abrir.ps1', 'launcher\icon.ico', 'unins000.exe') {
+            if (-not (Test-Path "$app\$f")) { throw "Faltando: $f" }
+            "ok: $f"
+          }
+          foreach ($l in "$([Environment]::GetFolderPath('Programs'))\OmniTempus.SI.lnk", "$([Environment]::GetFolderPath('Desktop'))\OmniTempus.SI.lnk") {
+            if (-not (Test-Path $l)) { throw "Atalho faltando: $l" }
+            "ok: atalho $l"
+          }
+          $cmd = (Get-ItemProperty 'HKCU:\Software\Classes\omnitempus\shell\open\command').'(default)'
+          if ($cmd -notlike '*abrir.ps1*') { throw 'O link omnitempus:// não foi registrado.' }
+          'ok: link omnitempus://'
+
+      - name: 4. Abrir como o atalho do menu Iniciar faz
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $lnk = (New-Object -ComObject WScript.Shell).CreateShortcut("$([Environment]::GetFolderPath('Programs'))\OmniTempus.SI.lnk")
+          "atalho: $($lnk.TargetPath) $($lnk.Arguments)"
+          # Same command as the shortcut; -ServerOnly skips opening the browser window on this headless machine.
+          $p = Start-Process $lnk.TargetPath -ArgumentList "$($lnk.Arguments) -ServerOnly" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "O lançador terminou com código $($p.ExitCode) (o app não respondeu)." }
+          (Invoke-WebRequest "$env:URL/api/health" -UseBasicParsing).StatusCode
+          "página: $((Invoke-WebRequest "$env:URL/" -UseBasicParsing).StatusCode)"
+
+      - name: 5. Colar a chave de acesso e criar a senha
+        env:
+          CHAVE: ${{ secrets.CHAVE_TESTE }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $s = Invoke-RestMethod "$env:URL/api/auth/status"
+          if ($s.licensed) { throw 'O app já veio com uma chave: não devia.' }
+          "antes da chave, o app diz: $($s.licenseError)"
+          if (-not $env:CHAVE) { 'Sem o segredo CHAVE_TESTE: pulando a chave e a senha.'; exit 0 }
+          $h = @{ Origin = $env:URL }
+          $r = Invoke-RestMethod "$env:URL/api/auth/license" -Method Post -Headers $h -ContentType 'application/json' -Body (@{ license = $env:CHAVE } | ConvertTo-Json)
+          "chave aceita para: $($r.name)"
+          Invoke-RestMethod "$env:URL/api/auth/setup" -Method Post -Headers $h -ContentType 'application/json' -Body (@{ password = 'senha-so-de-teste-123' } | ConvertTo-Json) -SessionVariable sess | Out-Null
+          $s = Invoke-RestMethod "$env:URL/api/auth/status" -WebSession $sess
+          if (-not $s.licensed -or -not $s.authenticated) { throw "Depois da senha o app não abriu: $($s | ConvertTo-Json -Compress)" }
+          'ok: chave ativa, senha criada, app aberto (próxima tela: as cinco perguntas)'
+
+      - name: 6. Desinstalar e conferir que os dados ficaram
+        env:
+          TEM_CHAVE: ${{ secrets.CHAVE_TESTE != '' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $app = "$env:LOCALAPPDATA\Programs\OmniTempus.SI"
+          Start-Process "$app\unins000.exe" -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait
+          # The uninstaller hands over to a copy of itself in %TEMP%: wait for the files to go.
+          foreach ($i in 1..60) { if (-not (Test-Path "$app\app")) { break }; Start-Sleep -Seconds 1 }
+          if (Test-Path "$app\app") { throw 'Os arquivos do app ficaram depois de desinstalar (o servidor travou algum?).' }
+          'ok: app removido'
+          if (Test-Path "$([Environment]::GetFolderPath('Desktop'))\OmniTempus.SI.lnk") { throw 'O atalho da área de trabalho ficou.' }
+          if (Test-Path 'HKCU:\Software\Classes\omnitempus') { throw 'O link omnitempus:// ficou registrado.' }
+          'ok: atalhos e link removidos'
+          # The password file only exists if step 5 ran with the key.
+          if ($env:TEM_CHAVE -eq 'true') {
+            if (-not (Test-Path "$env:APPDATA\painel-nitro\auth.json")) { throw 'Os dados da pessoa foram apagados: deviam ficar.' }
+            'ok: dados mantidos em %APPDATA%\painel-nitro (para reinstalar sem perder nada)'
+          }
+
+      - name: Guardar o log da instalação
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-instalacao
+          path: ${{ runner.temp }}\install.log
+          if-no-files-found: ignore
